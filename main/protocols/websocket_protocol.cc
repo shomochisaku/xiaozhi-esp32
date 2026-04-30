@@ -83,9 +83,9 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
 bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     // Read the gateway URL from NVS (set via the WiFi config UI's "websocket
-    // url" field on first boot, e.g. "ws://192.168.1.42:8765"). The legacy
-    // OTA-config code path is disabled in application.cc by design — this
-    // firmware always speaks to a stackchan-mcp gateway directly.
+    // url" field on first boot, e.g. "ws://<your-gateway-lan-ip>:8765"). The
+    // legacy OTA-config code path is disabled in application.cc by design —
+    // this firmware always speaks to a stackchan-mcp gateway directly.
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
     int version = settings.GetInt("version");
