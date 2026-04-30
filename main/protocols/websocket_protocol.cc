@@ -82,7 +82,8 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
 
 bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
-    std::string url = settings.GetString("url");
+    // Always use hardcoded nagi gateway URL (ignore NVS cache)
+    std::string url = "ws://192.168.0.16:8765";
     std::string token = settings.GetString("token");
     int version = settings.GetInt("version");
     if (version != 0) {
