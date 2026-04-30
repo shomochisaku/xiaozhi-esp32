@@ -1,0 +1,1581 @@
+#include "wifi_board.h"
+#include "cores3_audio_codec.h"
+#include "display/lcd_display.h"
+#include "application.h"
+#include "config.h"
+#include "power_save_timer.h"
+#include "i2c_device.h"
+#include "axp2101.h"
+#include "mcp_server.h"
+#include "SCSCL.h"
+#include "avatar_images.h"
+
+#include <esp_log.h>
+#include <driver/i2c_master.h>
+#include <driver/gpio.h>
+#include <driver/uart.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_ili9341.h>
+#include <esp_timer.h>
+#include <esp_random.h>
+#include "esp_video.h"
+#include <cJSON.h>
+#include <lvgl.h>
+#include <memory>
+#include <string>
+
+#define TAG "StackChanBoard"
+
+class Pmic : public Axp2101 {
+public:
+    // Power Init
+    Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
+        uint8_t data = ReadReg(0x90);
+        data |= 0b10110100;
+        WriteReg(0x90, data);
+        WriteReg(0x99, (0b11110 - 5));
+        WriteReg(0x97, (0b11110 - 2));
+        WriteReg(0x69, 0b00110101);
+        WriteReg(0x30, 0b111111);
+        WriteReg(0x90, 0xBF);
+        WriteReg(0x94, 33 - 5);
+        WriteReg(0x95, 33 - 5);
+    }
+
+    void SetBrightness(uint8_t brightness) {
+        brightness = ((brightness + 641) >> 5);
+        WriteReg(0x99, brightness);
+    }
+};
+
+class CustomBacklight : public Backlight {
+public:
+    CustomBacklight(Pmic *pmic) : pmic_(pmic) {}
+
+    void SetBrightnessImpl(uint8_t brightness) override {
+        pmic_->SetBrightness(target_brightness_);
+        brightness_ = target_brightness_;
+    }
+
+private:
+    Pmic *pmic_;
+};
+
+class Aw9523 : public I2cDevice {
+public:
+    // Exanpd IO Init
+    Aw9523(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {
+        WriteReg(0x02, 0b00000111);  // P0
+        WriteReg(0x03, 0b10001111);  // P1
+        WriteReg(0x04, 0b00011000);  // CONFIG_P0
+        WriteReg(0x05, 0b00001100);  // CONFIG_P1
+        WriteReg(0x11, 0b00010000);  // GCR P0 port is Push-Pull mode.
+        WriteReg(0x12, 0b11111111);  // LEDMODE_P0
+        WriteReg(0x13, 0b11111111);  // LEDMODE_P1
+    }
+
+    void ResetAw88298() {
+        ESP_LOGI(TAG, "Reset AW88298");
+        WriteReg(0x02, 0b00000011);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        WriteReg(0x02, 0b00000111);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    void ResetIli9342() {
+        ESP_LOGI(TAG, "Reset IlI9342");
+        WriteReg(0x03, 0b10000001);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        WriteReg(0x03, 0b10000011);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+};
+
+class Ft6336 : public I2cDevice {
+public:
+    struct TouchPoint_t {
+        int num = 0;
+        int x = -1;
+        int y = -1;
+    };
+    
+    Ft6336(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {
+        uint8_t chip_id = ReadReg(0xA3);
+        ESP_LOGI(TAG, "Get chip ID: 0x%02X", chip_id);
+        read_buffer_ = new uint8_t[6];
+    }
+
+    ~Ft6336() {
+        delete[] read_buffer_;
+    }
+
+    void UpdateTouchPoint() {
+        ReadRegs(0x02, read_buffer_, 6);
+        tp_.num = read_buffer_[0] & 0x0F;
+        tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
+        tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
+    }
+
+    inline const TouchPoint_t& GetTouchPoint() {
+        return tp_;
+    }
+
+private:
+    uint8_t* read_buffer_ = nullptr;
+    TouchPoint_t tp_;
+};
+
+// Minimal PY32 IO Expander driver (servo power switch on pin 0 / VM EN).
+// Ported from M5Stack-BSP PY32IOExpander.cpp.
+//
+// IMPORTANT: this class deliberately does NOT inherit from I2cDevice.
+// The base I2cDevice registers every device at scl_speed_hz = 400 kHz, but
+// the M5 reference implementation (`PY32IOExpander_Class`) defaults to
+// 100 kHz, and 400 kHz appears to leave PY32 in a half-finished slave
+// state — `i2c_master_probe` returns ACK but the very next
+// `i2c_master_transmit_receive` for REG_VERSION times out (0x103) every
+// time. We register our own i2c_master device handle at 100 kHz to match
+// the M5 default. Other peripherals on the bus (Si12T at 0x68, AXP2101,
+// AW9523, FT6336) keep using the 400 kHz path through I2cDevice.
+//
+// Reliability notes:
+//  - Each I2C op transparently retries up to I2C_INNER_RETRIES on transient
+//    errors, with a short vTaskDelay between attempts.
+//  - All bit-level write helpers propagate success as bool so the caller
+//    can decide whether the GPIO actually got configured.
+//  - Begin() can optionally return the version byte so the caller can log
+//    which attempt finally talked to the chip.
+class Py32IoExpander {
+public:
+    static constexpr uint8_t  DEFAULT_ADDR = 0x6F;
+    static constexpr uint32_t I2C_FREQ_HZ  = 100000;  // 100 kHz (M5 default)
+    static constexpr uint8_t  REG_GPIO_O_L_PUBLIC = 0x05;  // exposed for verify
+
+    Py32IoExpander(i2c_master_bus_handle_t i2c_bus, uint8_t addr = DEFAULT_ADDR) {
+        i2c_device_config_t cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address  = addr,
+            .scl_speed_hz    = I2C_FREQ_HZ,
+            .scl_wait_us     = 0,
+            .flags           = { .disable_ack_check = 0 },
+        };
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &cfg, &i2c_device_));
+    }
+
+    // Probe the chip. On success, returns true and (if non-null) writes the
+    // version byte to out_version. Internal reads use SafeReadReg, which
+    // already retries on transient I2C errors — so the chip is genuinely
+    // unreachable / not yet ready when this returns false.
+    bool Begin(uint8_t* out_version = nullptr) {
+        uint8_t version = 0;
+        if (!SafeReadReg(REG_VERSION, &version)) {
+            return false;
+        }
+        if (version == 0x00 || version == 0xFF) {
+            return false;
+        }
+        if (out_version != nullptr) {
+            *out_version = version;
+        }
+        return true;
+    }
+
+    // direction: false=input, true=output
+    bool SetDirection(uint8_t pin, bool output) {
+        return WriteBitSafe(REG_GPIO_M_L, pin, output);
+    }
+
+    // mode: false=pull down, true=pull up
+    bool SetPullMode(uint8_t pin, bool up) {
+        if (up) {
+            bool a = WriteBitSafe(REG_GPIO_PD_L, pin, false);
+            bool b = WriteBitSafe(REG_GPIO_PU_L, pin, true);
+            return a && b;
+        } else {
+            bool a = WriteBitSafe(REG_GPIO_PU_L, pin, false);
+            bool b = WriteBitSafe(REG_GPIO_PD_L, pin, true);
+            return a && b;
+        }
+    }
+
+    bool DigitalWrite(uint8_t pin, bool level) {
+        return WriteBitSafe(REG_GPIO_O_L, pin, level);
+    }
+
+    // Read back the current output low-byte register (pins 0..7) for
+    // verification after DigitalWrite. Returns false if the read failed.
+    bool ReadOutputLow(uint8_t* out) {
+        return SafeReadReg(REG_GPIO_O_L, out);
+    }
+
+private:
+    // Owned device handle (NOT inherited from I2cDevice — see class comment).
+    // Registered at 100 kHz in the constructor so this transport runs slower
+    // than the rest of the bus.
+    i2c_master_dev_handle_t i2c_device_ = nullptr;
+
+    static constexpr uint8_t REG_VERSION  = 0x02;
+    static constexpr uint8_t REG_GPIO_M_L = 0x03;  // Direction (mode) low byte
+    static constexpr uint8_t REG_GPIO_O_L = 0x05;  // Output low byte
+    static constexpr uint8_t REG_GPIO_PU_L = 0x09; // Pull-up low byte
+    static constexpr uint8_t REG_GPIO_PD_L = 0x0B; // Pull-down low byte
+
+    // I2C op transient-retry parameters. Total budget per failed op is
+    // (I2C_INNER_RETRIES - 1) * I2C_RETRY_DELAY_MS, i.e. ~30 ms here.
+    static constexpr int I2C_INNER_RETRIES  = 3;
+    static constexpr int I2C_RETRY_DELAY_MS = 15;
+
+    // Safe I2C read — retries up to I2C_INNER_RETRIES on transient errors,
+    // logs WARN only on the final failure to keep the log readable.
+    bool SafeReadReg(uint8_t reg, uint8_t* out) {
+        esp_err_t err = ESP_FAIL;
+        for (int i = 0; i < I2C_INNER_RETRIES; i++) {
+            err = i2c_master_transmit_receive(i2c_device_, &reg, 1, out, 1, 100);
+            if (err == ESP_OK) {
+                return true;
+            }
+            if (i + 1 < I2C_INNER_RETRIES) {
+                vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
+            }
+        }
+        ESP_LOGW("Py32IoExpander", "I2C read reg 0x%02X failed after %d tries: 0x%X",
+                 reg, I2C_INNER_RETRIES, err);
+        return false;
+    }
+
+    // Safe I2C write — same retry semantics as SafeReadReg.
+    bool SafeWriteReg(uint8_t reg, uint8_t value) {
+        uint8_t buffer[2] = {reg, value};
+        esp_err_t err = ESP_FAIL;
+        for (int i = 0; i < I2C_INNER_RETRIES; i++) {
+            err = i2c_master_transmit(i2c_device_, buffer, 2, 100);
+            if (err == ESP_OK) {
+                return true;
+            }
+            if (i + 1 < I2C_INNER_RETRIES) {
+                vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
+            }
+        }
+        ESP_LOGW("Py32IoExpander", "I2C write reg 0x%02X failed after %d tries: 0x%X",
+                 reg, I2C_INNER_RETRIES, err);
+        return false;
+    }
+
+    // Read-Modify-Write a single bit using safe I2C. Pin 0..7 only.
+    // Returns false if either the read or the write step ultimately failed.
+    bool WriteBitSafe(uint8_t reg, uint8_t pin, bool value) {
+        if (pin >= 8) {
+            return false;
+        }
+        uint8_t v = 0;
+        if (!SafeReadReg(reg, &v)) {
+            return false;
+        }
+        if (value) {
+            v |= (uint8_t)(1u << pin);
+        } else {
+            v &= (uint8_t)~(1u << pin);
+        }
+        return SafeWriteReg(reg, v);
+    }
+};
+
+// Minimal Si12T driver (12-channel capacitive touch sensor, TSM12-compatible).
+// Used for the StackChan head-stroke / head-tap detection. Only the read path
+// (Output1 register, channels 1-4) is needed for Phase 7. We expose just the
+// first three channels through ReadTouchState() because the StackChan head
+// has 3 conductive zones wired to TS1..TS3.
+//
+// Datasheet excerpt:
+//   - I2C 7-bit address: 0xD0 >> 1 == 0x68 when ID_SEL pin is tied to GND.
+//     This matches the address probed at boot ("0x68").
+//   - Reset value of CTRL (0x09) is 0b00000111 (SLEEP=1). We must clear SLEEP
+//     to enter normal sensing mode: CTRL = 0b00000011.
+//   - Output1 (0x10) packs four channels into one byte (2 bits per channel):
+//       bit[1:0] = OUT1, bit[3:2] = OUT2, bit[5:4] = OUT3, bit[7:6] = OUT4
+//       00 = no output, 01 = low, 10 = medium, 11 = high.
+//   - There is no dedicated chip-id register, so Begin() validates the device
+//     via successful I2C ACK on the CTRL read + non-0xFF Output1 read.
+class Si12T : public I2cDevice {
+public:
+    static constexpr uint8_t DEFAULT_ADDR = 0x68;  // ID_SEL = GND
+
+    struct TouchState {
+        bool zone[3];          // CH1, CH2, CH3 — true if any output level set
+        uint8_t output1_raw;   // raw Output1 register byte (0x10)
+        bool ok;               // false if the I2C read failed
+    };
+
+    Si12T(i2c_master_bus_handle_t i2c_bus, uint8_t addr = DEFAULT_ADDR)
+        : I2cDevice(i2c_bus, addr) {}
+
+    // Probe the chip and bring it out of sleep. Returns true on success.
+    bool Begin() {
+        uint8_t ctrl = 0;
+        if (!SafeReadReg(REG_CTRL, &ctrl)) {
+            return false;
+        }
+        // CTRL bit1 = SLEEP. Clear it; bit1:0 must hold 1 per datasheet
+        // ("CTRL Bit1, Bit0 = 1 1" reset value), so write 0b00000011.
+        if (!SafeWriteReg(REG_CTRL, 0x03)) {
+            return false;
+        }
+        // Verify the device actually responds on the output register.
+        // 0xFF would indicate an open bus / no device.
+        uint8_t out1 = 0;
+        if (!SafeReadReg(REG_OUTPUT1, &out1)) {
+            return false;
+        }
+        if (out1 == 0xFF) {
+            ESP_LOGW("Si12T", "Output1 read 0xFF (likely no device)");
+            return false;
+        }
+        ESP_LOGI("Si12T", "init OK: ctrl=0x%02X out1=0x%02X (sleep cleared)", ctrl, out1);
+        return true;
+    }
+
+    // Sample channels CH1..CH3 from Output1 (0x10). Single-shot read; the
+    // caller is expected to debounce / interpret duration externally.
+    TouchState ReadTouchState() {
+        TouchState s = {};
+        s.ok = false;
+        if (!SafeReadReg(REG_OUTPUT1, &s.output1_raw)) {
+            return s;
+        }
+        s.ok = true;
+        // Each channel uses 2 bits; nonzero = touched at some level.
+        s.zone[0] = ((s.output1_raw >> 0) & 0x3) != 0;  // CH1
+        s.zone[1] = ((s.output1_raw >> 2) & 0x3) != 0;  // CH2
+        s.zone[2] = ((s.output1_raw >> 4) & 0x3) != 0;  // CH3
+        return s;
+    }
+
+private:
+    static constexpr uint8_t REG_CTRL    = 0x09;  // CTRL, SLEEP bit etc.
+    static constexpr uint8_t REG_OUTPUT1 = 0x10;  // CH1..CH4 packed (2bpp)
+
+    bool SafeReadReg(uint8_t reg, uint8_t* out) {
+        esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, out, 1, 100);
+        if (err != ESP_OK) {
+            ESP_LOGW("Si12T", "I2C read reg 0x%02X failed: 0x%X", reg, err);
+            return false;
+        }
+        return true;
+    }
+
+    bool SafeWriteReg(uint8_t reg, uint8_t value) {
+        uint8_t buffer[2] = {reg, value};
+        esp_err_t err = i2c_master_transmit(i2c_device_, buffer, 2, 100);
+        if (err != ESP_OK) {
+            ESP_LOGW("Si12T", "I2C write reg 0x%02X failed: 0x%X", reg, err);
+            return false;
+        }
+        return true;
+    }
+};
+
+class StackChanBoard : public WifiBoard {
+private:
+    i2c_master_bus_handle_t i2c_bus_;
+    Pmic* pmic_;
+    Aw9523* aw9523_;
+    Ft6336* ft6336_;
+    LcdDisplay* display_;
+    EspVideo* camera_;
+    esp_timer_handle_t touchpad_timer_;
+    PowerSaveTimer* power_save_timer_;
+    SCSCL scs_bus_;
+    std::unique_ptr<Py32IoExpander> io_expander_;
+
+    // Avatar overlay state. avatar_img_ is created lazily on the active LVGL
+    // screen because the screen tree (container_, emoji_label_, ...) is built
+    // by Application::Start() -> Display::SetupUI(), which runs after this
+    // board's constructor completes. avatar_init_timer_ retries every 500 ms
+    // until the screen is ready, then stops itself.
+    lv_obj_t* avatar_img_ = nullptr;
+    esp_timer_handle_t avatar_init_timer_ = nullptr;
+    std::string current_avatar_face_ = "idle";
+
+    // Phase 2: blinking + lip-sync overlay state.
+    // Blink works as a four-step state machine driven by blink_step_timer_:
+    //   FACE -> EYES_HALF -> EYES_CLOSED -> EYES_HALF -> FACE (restore last face)
+    // Each step is BLINK_STEP_MS apart. While a blink is in progress, further
+    // schedule events are dropped (we run to completion before re-arming).
+    // blink_schedule_timer_ fires every 3-6s (re-armed each cycle) and triggers
+    // a new blink only if blink_enabled_ and no other blink is in flight.
+    enum class BlinkState : uint8_t {
+        IDLE = 0,
+        EYES_HALF_DOWN,
+        EYES_CLOSED,
+        EYES_HALF_UP,
+    };
+    static constexpr int BLINK_STEP_MS = 100;
+    static constexpr int BLINK_MIN_GAP_MS = 3000;
+    static constexpr int BLINK_MAX_GAP_MS = 6000;
+    esp_timer_handle_t blink_schedule_timer_ = nullptr;
+    esp_timer_handle_t blink_step_timer_ = nullptr;
+    BlinkState blink_state_ = BlinkState::IDLE;
+    bool blink_enabled_ = false;
+
+    // Phase 7: Si12T head-touch sensing.
+    // Polling every TOUCH_POLL_MS samples Output1 (CH1..CH3 -> 3 head zones).
+    // Edge detection on the OR of the three zones produces TAP / STROKE
+    // gestures based on hold duration:
+    //   duration <  TAP_MAX_MS (400 ms)  -> TAP    -> face=surprised
+    //   duration >= STROKE_MIN_MS (600 ms) -> STROKE -> face=embarrassed + servo wobble
+    //   400 <= duration < 600 ms         -> treated as TAP (greyzone)
+    // Reactions auto-revert to "idle" after REACTION_HOLD_MS (3 s). A
+    // post-reaction COOLDOWN_MS lock-out prevents one head-pat from firing
+    // a chain of events.
+    enum class TouchEvent : uint8_t {
+        IDLE = 0,
+        TAP,
+        STROKE,
+    };
+    static constexpr int TOUCH_POLL_MS    = 100;  // 100 Hz polling
+    static constexpr int TAP_MAX_MS       = 400;
+    static constexpr int STROKE_MIN_MS    = 400;  // was 600; lowered because
+                                                  // finger-glide between zones
+                                                  // and Si12T auto-recalibration
+                                                  // inject brief "all-false"
+                                                  // gaps that cut a real stroke
+                                                  // short of 600 ms.
+    static constexpr int REACTION_HOLD_MS = 3000;
+    static constexpr int COOLDOWN_MS      = 800;  // post-reaction noise gate
+    // With 2-sample debounce this gives ~200 ms confirm latency, fast enough
+    // to catch a quick "pon" (~200 ms press) while still rejecting single-
+    // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
+    // dropped most short taps.
+    static constexpr int SERVO_WOBBLE_STEP_MS = 200;
+    static constexpr int SERVO_WOBBLE_AMPLITUDE_DEG = 20;
+
+    std::unique_ptr<Si12T> si12t_;
+    bool si12t_ok_ = false;
+    esp_timer_handle_t touch_poll_timer_ = nullptr;
+    esp_timer_handle_t touch_revert_timer_ = nullptr;
+    esp_timer_handle_t servo_wobble_timer_ = nullptr;
+
+    // Touch detection state (single-thread access from the touch_poll_timer_
+    // callback, which runs on the ESP_TIMER_TASK).
+    bool touch_pressed_prev_ = false;          // last sample (debounced)
+    bool touch_pressed_pending_ = false;       // candidate awaiting confirm
+    int  touch_pending_count_ = 0;             // consecutive samples matching
+    uint64_t touch_press_start_us_ = 0;        // when pressed_prev_ went true
+    uint64_t cooldown_until_us_ = 0;           // ignore press until this ts
+
+    // Last reported event for MCP get_touch_state.
+    TouchEvent last_event_ = TouchEvent::IDLE;
+    uint64_t   last_event_us_ = 0;
+    bool       last_zone_snapshot_[3] = {false, false, false};
+    uint8_t    last_output1_raw_ = 0;
+
+    // Servo wobble sub-state. Keeps the previously-set angles untouched
+    // before/after the wobble so that an external set_head_angles call is
+    // not silently overwritten beyond the wobble window.
+    int servo_wobble_step_ = 0;       // 0..3 sequence index
+    bool servo_wobble_active_ = false;
+
+    void InitializePowerSaveTimer() {
+        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_->OnEnterSleepMode([this]() {
+            GetDisplay()->SetPowerSaveMode(true);
+            GetBacklight()->SetBrightness(10);
+        });
+        power_save_timer_->OnExitSleepMode([this]() {
+            GetDisplay()->SetPowerSaveMode(false);
+            GetBacklight()->RestoreBrightness();
+        });
+        power_save_timer_->OnShutdownRequest([this]() {
+            pmic_->PowerOff();
+        });
+        power_save_timer_->SetEnabled(true);
+    }
+
+    void InitializeI2c() {
+        // Initialize I2C peripheral
+        i2c_master_bus_config_t i2c_bus_cfg = {
+            .i2c_port = (i2c_port_t)1,
+            .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
+            .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .intr_priority = 0,
+            .trans_queue_depth = 0,
+            .flags = {
+                .enable_internal_pullup = 1,
+            },
+        };
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+    }
+
+    void I2cDetect() {
+        uint8_t address;
+        printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\r\n");
+        for (int i = 0; i < 128; i += 16) {
+            printf("%02x: ", i);
+            for (int j = 0; j < 16; j++) {
+                fflush(stdout);
+                address = i + j;
+                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(200));
+                if (ret == ESP_OK) {
+                    printf("%02x ", address);
+                } else if (ret == ESP_ERR_TIMEOUT) {
+                    printf("UU ");
+                } else {
+                    printf("-- ");
+                }
+            }
+            printf("\r\n");
+        }
+    }
+
+    void InitializeAxp2101() {
+        ESP_LOGI(TAG, "Init AXP2101");
+        pmic_ = new Pmic(i2c_bus_, 0x34);
+    }
+
+    void InitializeAw9523() {
+        ESP_LOGI(TAG, "Init AW9523");
+        aw9523_ = new Aw9523(i2c_bus_, 0x58);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    void PollTouchpad() {
+        static bool was_touched = false;
+        static int64_t touch_start_time = 0;
+        const int64_t TOUCH_THRESHOLD_MS = 500;  // 触摸时长阈值，超过500ms视为长按
+        
+        ft6336_->UpdateTouchPoint();
+        auto& touch_point = ft6336_->GetTouchPoint();
+        
+        // 检测触摸开始
+        if (touch_point.num > 0 && !was_touched) {
+            was_touched = true;
+            touch_start_time = esp_timer_get_time() / 1000; // 转换为毫秒
+        } 
+        // 检测触摸释放
+        else if (touch_point.num == 0 && was_touched) {
+            was_touched = false;
+            int64_t touch_duration = (esp_timer_get_time() / 1000) - touch_start_time;
+            
+            // 只有短触才触发
+            if (touch_duration < TOUCH_THRESHOLD_MS) {
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                    return;
+                }
+                app.ToggleChatState();
+            }
+        }
+    }
+
+    void InitializeFt6336TouchPad() {
+        ESP_LOGI(TAG, "Init FT6336");
+        ft6336_ = new Ft6336(i2c_bus_, 0x38);
+        
+        // 创建定时器，20ms 间隔
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                StackChanBoard* board = (StackChanBoard*)arg;
+                board->PollTouchpad();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "touchpad_timer",
+            .skip_unhandled_events = true,
+        };
+        
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &touchpad_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(touchpad_timer_, 20 * 1000));
+    }
+
+    void InitializeSpi() {
+        spi_bus_config_t buscfg = {};
+        buscfg.mosi_io_num = GPIO_NUM_37;
+        buscfg.miso_io_num = GPIO_NUM_NC;
+        buscfg.sclk_io_num = GPIO_NUM_36;
+        buscfg.quadwp_io_num = GPIO_NUM_NC;
+        buscfg.quadhd_io_num = GPIO_NUM_NC;
+        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+        ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    }
+
+    void InitializeIli9342Display() {
+        ESP_LOGI(TAG, "Init IlI9342");
+
+        esp_lcd_panel_io_handle_t panel_io = nullptr;
+        esp_lcd_panel_handle_t panel = nullptr;
+
+        ESP_LOGD(TAG, "Install panel IO");
+        esp_lcd_panel_io_spi_config_t io_config = {};
+        io_config.cs_gpio_num = GPIO_NUM_3;
+        io_config.dc_gpio_num = GPIO_NUM_35;
+        io_config.spi_mode = 2;
+        io_config.pclk_hz = 40 * 1000 * 1000;
+        io_config.trans_queue_depth = 10;
+        io_config.lcd_cmd_bits = 8;
+        io_config.lcd_param_bits = 8;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
+
+        ESP_LOGD(TAG, "Install LCD driver");
+        esp_lcd_panel_dev_config_t panel_config = {};
+        panel_config.reset_gpio_num = GPIO_NUM_NC;
+        panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR;
+        panel_config.bits_per_pixel = 16;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(panel_io, &panel_config, &panel));
+        
+        esp_lcd_panel_reset(panel);
+        aw9523_->ResetIli9342();
+
+        esp_lcd_panel_init(panel);
+        esp_lcd_panel_invert_color(panel, true);
+        esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
+        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+
+        display_ = new SpiLcdDisplay(panel_io, panel,
+                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+    }
+
+     void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D0,
+                [1] = CAMERA_PIN_D1,
+                [2] = CAMERA_PIN_D2,
+                [3] = CAMERA_PIN_D3,
+                [4] = CAMERA_PIN_D4,
+                [5] = CAMERA_PIN_D5,
+                [6] = CAMERA_PIN_D6,
+                [7] = CAMERA_PIN_D7,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = false,
+            .i2c_handle = i2c_bus_,
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new EspVideo(video_config);
+        camera_->SetHMirror(false);
+    }
+
+    bool servo_ok_ = false;
+
+    void InitializeIOExpander() {
+        ESP_LOGI(TAG, "Init PY32 IO expander (I2C addr 0x%02X)", Py32IoExpander::DEFAULT_ADDR);
+        io_expander_ = std::unique_ptr<Py32IoExpander>(new Py32IoExpander(i2c_bus_));
+
+        // PY32 boots slowly and is unreliable in the first few hundred ms
+        // after power-on. Retry the probe up to 5 times with 500ms gaps —
+        // total budget ~2.5 s, which dominates boot latency by maybe 1.5 s
+        // in the worst case but is still well under the time spent on
+        // I2C scan + LCD panel init that happen earlier.
+        constexpr int kBeginRetries  = 5;
+        constexpr int kBeginDelayMs  = 500;
+        bool   ok = false;
+        uint8_t version = 0;
+        int     winning_attempt = 0;
+        for (int i = 0; i < kBeginRetries; i++) {
+            vTaskDelay(pdMS_TO_TICKS(kBeginDelayMs));
+            if (io_expander_->Begin(&version)) {
+                ok = true;
+                winning_attempt = i + 1;
+                break;
+            }
+            ESP_LOGW(TAG, "PY32 not responding, retry %d/%d", i + 1, kBeginRetries);
+        }
+
+        if (!ok) {
+            ESP_LOGE(TAG, "PY32 IO expander FAILED after %d attempts; servo will be POWERLESS",
+                     kBeginRetries);
+            io_expander_.reset();
+            return;
+        }
+        ESP_LOGI(TAG, "PY32 IO expander READY (version=0x%02X, attempt=%d/%d)",
+                 version, winning_attempt, kBeginRetries);
+
+        // Pin 0 = VM EN (servo power switch). Output, pull-up, drive HIGH.
+        // We track each step so a partial success is reported precisely
+        // (e.g. direction set but pull-up failed) — much easier to debug
+        // than the previous "all-void, hope it stuck" version.
+        bool ok_dir   = io_expander_->SetDirection(0, true);
+        bool ok_pull  = io_expander_->SetPullMode(0, true);
+        bool ok_write = io_expander_->DigitalWrite(0, true);
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        if (!ok_dir || !ok_pull || !ok_write) {
+            const char* failed = "?";
+            if (!ok_dir)        failed = "SetDirection";
+            else if (!ok_pull)  failed = "SetPullMode";
+            else if (!ok_write) failed = "DigitalWrite";
+            ESP_LOGE(TAG, "Servo power ENABLE FAILED at step=%s", failed);
+            return;
+        }
+
+        // Verify by reading back the output low-byte register. Bit 0 must
+        // be high. If not, the chip ACK'd but the level didn't latch — log
+        // it loudly so we know the next move_head will be silent.
+        uint8_t out_low = 0;
+        if (io_expander_->ReadOutputLow(&out_low)) {
+            if (out_low & 0x01) {
+                ESP_LOGI(TAG, "Servo power ENABLED via PY32 pin 0 "
+                              "(VM EN HIGH confirmed, REG_GPIO_O_L=0x%02X)", out_low);
+            } else {
+                ESP_LOGE(TAG, "Servo power write succeeded but readback shows "
+                              "pin 0 LOW (REG_GPIO_O_L=0x%02X) — VM EN may be off!",
+                              out_low);
+            }
+        } else {
+            // Read failed but writes succeeded; assume the writes took.
+            ESP_LOGW(TAG, "Servo power writes OK, but readback verify failed "
+                          "(can't confirm VM EN level)");
+        }
+    }
+
+    void InitializeServo() {
+        ESP_LOGI(TAG, "Init SCS0009 servo bus (UART%d, baud=%d, tx=%d, rx=%d)",
+                 SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
+        servo_ok_ = scs_bus_.begin(SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
+        scs_bus_.Level = 0;  // Skip ACK wait — half-duplex TX-only mode
+        ESP_LOGI(TAG, "Servo bus init: %s (Level=0, no ACK)", servo_ok_ ? "OK" : "FAILED");
+    }
+
+    // ---- Phase 7: head-touch (Si12T) sensing + reaction ----------------
+
+    // Convenience wrapper around the existing servo write path. Mirrors the
+    // math used in the self.robot.set_head_angles MCP tool so that touch
+    // reactions and explicit MCP calls produce identical motion.
+    void WriteHeadAngles(int yaw_deg, int pitch_deg) {
+        int yaw_pos = 460 + yaw_deg * 16 / 5;
+        int pitch_pos = 620 + pitch_deg * 16 / 5;
+        if (yaw_pos < 0) yaw_pos = 0;
+        if (yaw_pos > 1000) yaw_pos = 1000;
+        if (pitch_pos < 0) pitch_pos = 0;
+        if (pitch_pos > 1000) pitch_pos = 1000;
+        scs_bus_.WritePos(SERVO_YAW_ID, yaw_pos, 100, 0);
+        scs_bus_.WritePos(SERVO_PITCH_ID, pitch_pos, 100, 0);
+    }
+
+    // Servo wobble: yaw -A -> +A -> -A -> 0, each step SERVO_WOBBLE_STEP_MS.
+    // Driven by servo_wobble_timer_ to avoid blocking the touch poll task.
+    static void ServoWobbleStepCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->ServoWobbleStepAdvance();
+    }
+
+    void ServoWobbleStepAdvance() {
+        const int A = SERVO_WOBBLE_AMPLITUDE_DEG;
+        switch (servo_wobble_step_) {
+            case 0: WriteHeadAngles(-A, 0); break;
+            case 1: WriteHeadAngles(+A, 0); break;
+            case 2: WriteHeadAngles(-A, 0); break;
+            case 3: WriteHeadAngles(  0, 0); break;
+            default:
+                servo_wobble_active_ = false;
+                return;
+        }
+        servo_wobble_step_++;
+        if (servo_wobble_step_ <= 3) {
+            esp_timer_start_once(servo_wobble_timer_,
+                                 (uint64_t)SERVO_WOBBLE_STEP_MS * 1000);
+        } else {
+            servo_wobble_active_ = false;
+        }
+    }
+
+    void StartServoWobble() {
+        if (!servo_ok_) {
+            ESP_LOGW(TAG, "Servo wobble skipped: servo not initialized");
+            return;
+        }
+        if (servo_wobble_active_) {
+            // Restart from step 0 if a new wobble is requested mid-flight.
+            esp_timer_stop(servo_wobble_timer_);
+        }
+        if (servo_wobble_timer_ == nullptr) {
+            esp_timer_create_args_t args = {
+                .callback = &StackChanBoard::ServoWobbleStepCb,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "servo_wobble",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&args, &servo_wobble_timer_));
+        }
+        servo_wobble_step_ = 0;
+        servo_wobble_active_ = true;
+        // Kick off the first step immediately.
+        ServoWobbleStepAdvance();
+    }
+
+    // Schedule a single-shot revert to "idle" face REACTION_HOLD_MS later.
+    // Re-arming overwrites any pending revert.
+    static void TouchRevertCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->SetAvatarExpression("idle");
+    }
+
+    void ScheduleIdleRevert() {
+        if (touch_revert_timer_ == nullptr) {
+            esp_timer_create_args_t args = {
+                .callback = &StackChanBoard::TouchRevertCb,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "touch_revert",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&args, &touch_revert_timer_));
+        }
+        esp_timer_stop(touch_revert_timer_);  // ok if not running
+        esp_timer_start_once(touch_revert_timer_,
+                             (uint64_t)REACTION_HOLD_MS * 1000);
+    }
+
+    void HandleTap() {
+        ESP_LOGI(TAG, "touch event: TAP (zones=%d%d%d raw=0x%02X)",
+                 last_zone_snapshot_[0], last_zone_snapshot_[1], last_zone_snapshot_[2],
+                 last_output1_raw_);
+        last_event_ = TouchEvent::TAP;
+        last_event_us_ = esp_timer_get_time();
+        SetAvatarExpression("surprised");
+        ScheduleIdleRevert();
+    }
+
+    void HandleStroke(uint64_t duration_ms) {
+        ESP_LOGI(TAG, "touch event: STROKE (zones=%d%d%d duration=%llums raw=0x%02X)",
+                 last_zone_snapshot_[0], last_zone_snapshot_[1], last_zone_snapshot_[2],
+                 (unsigned long long)duration_ms, last_output1_raw_);
+        last_event_ = TouchEvent::STROKE;
+        last_event_us_ = esp_timer_get_time();
+        SetAvatarExpression("embarrassed");
+        StartServoWobble();
+        ScheduleIdleRevert();
+    }
+
+    // 200 ms periodic poll. Reads the sensor, applies a 2-sample debounce on
+    // the OR of the three head zones, and emits TAP/STROKE on falling edges.
+    static void TouchPollCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->TouchPollTick();
+    }
+
+    void TouchPollTick() {
+        if (!si12t_ok_ || si12t_ == nullptr) {
+            return;
+        }
+        Si12T::TouchState s = si12t_->ReadTouchState();
+        if (!s.ok) {
+            return;
+        }
+        // Snapshot for MCP visibility.
+        last_output1_raw_ = s.output1_raw;
+        last_zone_snapshot_[0] = s.zone[0];
+        last_zone_snapshot_[1] = s.zone[1];
+        last_zone_snapshot_[2] = s.zone[2];
+
+        bool any_pressed = s.zone[0] || s.zone[1] || s.zone[2];
+
+        // Asymmetric debounce:
+        //   press   confirm = 2 samples ( 200 ms) — fast tap detection
+        //   release confirm = 4 samples ( 400 ms) — bridges Si12T recalibration
+        //                                            and finger-glide gaps that
+        //                                            otherwise cut a stroke
+        //                                            short and mis-classify it
+        //                                            as a tap.
+        // Keeping a press "sticky" through brief no-press blips is essential
+        // for the stroke gesture to reach STROKE_MIN_MS.
+        if (any_pressed == touch_pressed_pending_) {
+            touch_pending_count_++;
+        } else {
+            touch_pending_count_ = 1;
+            touch_pressed_pending_ = any_pressed;
+        }
+        const int needed = touch_pressed_pending_ ? 2 : 4;
+        if (touch_pending_count_ < needed) {
+            return;  // not yet debounced
+        }
+
+        bool now = touch_pressed_pending_;
+        if (now == touch_pressed_prev_) {
+            return;  // no edge
+        }
+
+        uint64_t now_us = esp_timer_get_time();
+
+        if (now) {
+            // Rising edge.
+            if (now_us < cooldown_until_us_) {
+                // Suppress press event while in post-reaction cooldown.
+                touch_pressed_prev_ = now;
+                touch_press_start_us_ = now_us;
+                return;
+            }
+            touch_pressed_prev_ = true;
+            touch_press_start_us_ = now_us;
+        } else {
+            // Falling edge: classify by hold duration.
+            touch_pressed_prev_ = false;
+            uint64_t duration_ms = (now_us - touch_press_start_us_) / 1000ULL;
+            if (now_us < cooldown_until_us_) {
+                // We were in cooldown when pressed — drop the release event too.
+                return;
+            }
+            if (duration_ms >= STROKE_MIN_MS) {
+                HandleStroke(duration_ms);
+            } else {
+                // Treat the 400-600 ms grey zone as TAP.
+                HandleTap();
+            }
+            cooldown_until_us_ = now_us + (uint64_t)COOLDOWN_MS * 1000ULL;
+        }
+    }
+
+    void InitializeSi12tTouch() {
+        ESP_LOGI(TAG, "Init Si12T head-touch sensor (I2C addr 0x%02X)", Si12T::DEFAULT_ADDR);
+        si12t_ = std::unique_ptr<Si12T>(new Si12T(i2c_bus_));
+        si12t_ok_ = si12t_->Begin();
+        if (!si12t_ok_) {
+            ESP_LOGW(TAG, "Si12T not detected; head-touch disabled (other features unaffected)");
+            si12t_.reset();
+            return;
+        }
+
+        esp_timer_create_args_t poll_args = {
+            .callback = &StackChanBoard::TouchPollCb,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "touch_poll",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&poll_args, &touch_poll_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(touch_poll_timer_,
+                                                 (uint64_t)TOUCH_POLL_MS * 1000));
+        ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval)", TOUCH_POLL_MS);
+    }
+
+    // Map a face name (idle/happy/...) to the embedded RGB565 image.
+    // Returns nullptr if the name is unknown.
+    static const lv_image_dsc_t* AvatarImageFor(const char* face) {
+        if (face == nullptr) return nullptr;
+        if (strcmp(face, "idle") == 0)        return &avatar_idle;
+        if (strcmp(face, "happy") == 0)       return &avatar_happy;
+        if (strcmp(face, "thinking") == 0)    return &avatar_thinking;
+        if (strcmp(face, "sad") == 0)         return &avatar_sad;
+        if (strcmp(face, "surprised") == 0)   return &avatar_surprised;
+        if (strcmp(face, "embarrassed") == 0) return &avatar_embarrassed;
+        return nullptr;
+    }
+
+    // Create avatar_img_ on the active LVGL screen, scaled to fill the LCD.
+    // Caller must hold the LVGL/display lock. Returns true on success or
+    // when avatar_img_ already exists.
+    bool EnsureAvatarObject() {
+        if (avatar_img_ != nullptr) {
+            return true;
+        }
+        lv_obj_t* screen = lv_screen_active();
+        if (screen == nullptr) {
+            return false;
+        }
+        avatar_img_ = lv_image_create(screen);
+        if (avatar_img_ == nullptr) {
+            return false;
+        }
+        // Center on the 320x240 LCD and upscale 160x120 -> ~320x240 (2x).
+        // lv_image_set_scale uses 256 = 1.0x; 512 = 2.0x.
+        lv_image_set_scale(avatar_img_, 512);
+        lv_obj_align(avatar_img_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_SCROLLABLE);
+        // Keep the avatar visually on top of the chat UI's emoji_label_,
+        // chat bubbles, etc. The status bar (clock/battery) lives on a
+        // separate sibling and is moved to foreground later if needed.
+        lv_obj_move_foreground(avatar_img_);
+        ESP_LOGI(TAG, "Avatar lv_image created on active screen");
+        return true;
+    }
+
+    // Apply the requested face to avatar_img_. Returns false if the face is
+    // unknown or the avatar object cannot be created yet.
+    bool SetAvatarExpressionLocked(const char* face) {
+        const lv_image_dsc_t* dsc = AvatarImageFor(face);
+        if (dsc == nullptr) {
+            return false;
+        }
+        if (!EnsureAvatarObject()) {
+            return false;
+        }
+        lv_image_set_src(avatar_img_, dsc);
+        lv_obj_move_foreground(avatar_img_);
+        current_avatar_face_ = face;
+        return true;
+    }
+
+    // Public-style entry that takes the display lock. Used by the MCP tool
+    // and by the deferred init timer. Always safe to call from any task.
+    bool SetAvatarExpression(const char* face) {
+        if (display_ == nullptr) {
+            ESP_LOGW(TAG, "SetAvatarExpression('%s') ignored: display_ not ready", face);
+            return false;
+        }
+        DisplayLockGuard lock(display_);
+        bool ok = SetAvatarExpressionLocked(face);
+        if (!ok) {
+            ESP_LOGW(TAG, "SetAvatarExpression('%s') deferred (face unknown or screen not ready)", face);
+        }
+        return ok;
+    }
+
+    // Schedule a one-shot/periodic timer that keeps trying to install the
+    // initial avatar image until the LVGL screen tree is ready (i.e. after
+    // Application::Start() has run Display::SetupUI()).
+    void InitializeAvatar() {
+        ESP_LOGI(TAG, "Schedule avatar init (deferred until SetupUI completes)");
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                StackChanBoard* board = static_cast<StackChanBoard*>(arg);
+                if (board->SetAvatarExpression("idle")) {
+                    ESP_LOGI(TAG, "Initial avatar (idle) installed");
+                    if (board->avatar_init_timer_ != nullptr) {
+                        esp_timer_stop(board->avatar_init_timer_);
+                    }
+                }
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "avatar_init",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &avatar_init_timer_));
+        // Retry every 500 ms; SetupUI() typically completes within a few
+        // hundred ms after Application::Start(). Once installed the callback
+        // stops the timer.
+        ESP_ERROR_CHECK(esp_timer_start_periodic(avatar_init_timer_, 500 * 1000));
+    }
+
+    // ---- Phase 2: parts (eyes / mouth) and blink state machine ----------
+    //
+    // Eye state images (avatar_eyes_open / _half / _closed) are referenced
+    // directly by the blink state machine; we don't expose a generic
+    // EyesImageFor() helper yet because no MCP tool sets eyes manually.
+    // Phase 3 may add `self.display.set_eyes` if needed.
+
+    // Map a mouth shape name to its full-frame image. Returns nullptr if unknown.
+    static const lv_image_dsc_t* MouthImageFor(const char* shape) {
+        if (shape == nullptr) return nullptr;
+        if (strcmp(shape, "closed") == 0) return &avatar_mouth_closed;
+        if (strcmp(shape, "half") == 0)   return &avatar_mouth_half;
+        if (strcmp(shape, "open") == 0)   return &avatar_mouth_open;
+        if (strcmp(shape, "e") == 0)      return &avatar_mouth_e;
+        if (strcmp(shape, "u") == 0)      return &avatar_mouth_u;
+        return nullptr;
+    }
+
+    // Swap avatar_img_ to a part image (eye or mouth). Caller must hold lock.
+    // Does NOT touch current_avatar_face_, so SetAvatarExpression(...) called
+    // later will still know what face to "return to".
+    bool SetPartImageLocked(const lv_image_dsc_t* dsc) {
+        if (dsc == nullptr) return false;
+        if (!EnsureAvatarObject()) return false;
+        lv_image_set_src(avatar_img_, dsc);
+        lv_obj_move_foreground(avatar_img_);
+        return true;
+    }
+
+    // Restore the last full-face expression after a part overlay.
+    bool RestoreCurrentFaceLocked() {
+        const lv_image_dsc_t* dsc = AvatarImageFor(current_avatar_face_.c_str());
+        if (dsc == nullptr) {
+            // Fall back to idle if somehow stale.
+            dsc = &avatar_idle;
+        }
+        if (!EnsureAvatarObject()) return false;
+        lv_image_set_src(avatar_img_, dsc);
+        lv_obj_move_foreground(avatar_img_);
+        return true;
+    }
+
+    // Public mouth setter: wraps lock + look-up.
+    bool SetMouthShape(const char* shape) {
+        if (display_ == nullptr) {
+            ESP_LOGW(TAG, "SetMouthShape('%s') ignored: display_ not ready", shape);
+            return false;
+        }
+        const lv_image_dsc_t* dsc = MouthImageFor(shape);
+        if (dsc == nullptr) {
+            return false;
+        }
+        DisplayLockGuard lock(display_);
+        return SetPartImageLocked(dsc);
+    }
+
+    // Step callback for the four-phase blink sequence. Each invocation
+    // advances blink_state_, applies the corresponding image, and re-arms
+    // blink_step_timer_ unless we're returning to the resting face.
+    static void BlinkStepCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->BlinkStepAdvance();
+    }
+
+    void BlinkStepAdvance() {
+        if (display_ == nullptr) {
+            blink_state_ = BlinkState::IDLE;
+            return;
+        }
+        DisplayLockGuard lock(display_);
+        switch (blink_state_) {
+            case BlinkState::EYES_HALF_DOWN:
+                SetPartImageLocked(&avatar_eyes_closed);
+                blink_state_ = BlinkState::EYES_CLOSED;
+                esp_timer_start_once(blink_step_timer_, BLINK_STEP_MS * 1000);
+                break;
+            case BlinkState::EYES_CLOSED:
+                SetPartImageLocked(&avatar_eyes_half);
+                blink_state_ = BlinkState::EYES_HALF_UP;
+                esp_timer_start_once(blink_step_timer_, BLINK_STEP_MS * 1000);
+                break;
+            case BlinkState::EYES_HALF_UP:
+                // Final: restore the last applied face (Phase 2 trade-off:
+                // any active mouth overlay is replaced by the face image).
+                RestoreCurrentFaceLocked();
+                blink_state_ = BlinkState::IDLE;
+                break;
+            case BlinkState::IDLE:
+            default:
+                // Stale callback; nothing to do.
+                break;
+        }
+    }
+
+    // Schedule callback: fires roughly every BLINK_MIN_GAP_MS..BLINK_MAX_GAP_MS.
+    // Starts a new blink if enabled and not already blinking, then re-arms
+    // itself with a fresh random interval.
+    static void BlinkScheduleCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->BlinkScheduleTick();
+    }
+
+    void BlinkScheduleTick() {
+        if (blink_enabled_ && blink_state_ == BlinkState::IDLE && display_ != nullptr) {
+            // Begin the blink: half-down now, full-closed at next step.
+            DisplayLockGuard lock(display_);
+            if (SetPartImageLocked(&avatar_eyes_half)) {
+                blink_state_ = BlinkState::EYES_HALF_DOWN;
+                esp_timer_start_once(blink_step_timer_, BLINK_STEP_MS * 1000);
+            }
+        }
+        // Re-arm scheduler with a fresh random interval, even if we skipped
+        // this blink (e.g. avatar not yet on screen). This keeps the cadence
+        // organic instead of clumping after a long pause.
+        if (blink_enabled_) {
+            uint32_t span_ms = BLINK_MAX_GAP_MS - BLINK_MIN_GAP_MS;
+            uint32_t next_ms = BLINK_MIN_GAP_MS + (esp_random() % span_ms);
+            esp_timer_start_once(blink_schedule_timer_, (uint64_t)next_ms * 1000);
+        }
+    }
+
+    void EnsureBlinkTimers() {
+        if (blink_step_timer_ == nullptr) {
+            esp_timer_create_args_t step_args = {
+                .callback = &StackChanBoard::BlinkStepCb,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "blink_step",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&step_args, &blink_step_timer_));
+        }
+        if (blink_schedule_timer_ == nullptr) {
+            esp_timer_create_args_t sched_args = {
+                .callback = &StackChanBoard::BlinkScheduleCb,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "blink_sched",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&sched_args, &blink_schedule_timer_));
+        }
+    }
+
+    void StartBlinkTimer() {
+        EnsureBlinkTimers();
+        blink_enabled_ = true;
+        // Make sure no leftover schedule timer is running, then arm one with
+        // a fresh random interval.
+        esp_timer_stop(blink_schedule_timer_);
+        uint32_t span_ms = BLINK_MAX_GAP_MS - BLINK_MIN_GAP_MS;
+        uint32_t first_ms = BLINK_MIN_GAP_MS + (esp_random() % span_ms);
+        esp_timer_start_once(blink_schedule_timer_, (uint64_t)first_ms * 1000);
+        ESP_LOGI(TAG, "Blink ENABLED (first blink in %u ms)", (unsigned)first_ms);
+    }
+
+    void StopBlinkTimer() {
+        blink_enabled_ = false;
+        if (blink_schedule_timer_ != nullptr) {
+            esp_timer_stop(blink_schedule_timer_);
+        }
+        if (blink_step_timer_ != nullptr) {
+            esp_timer_stop(blink_step_timer_);
+        }
+        // If we stopped mid-sequence, snap back to the resting face so the
+        // user is not left staring at half-closed eyes.
+        if (blink_state_ != BlinkState::IDLE && display_ != nullptr) {
+            DisplayLockGuard lock(display_);
+            RestoreCurrentFaceLocked();
+        }
+        blink_state_ = BlinkState::IDLE;
+        ESP_LOGI(TAG, "Blink DISABLED");
+    }
+
+    void RegisterMcpTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        ESP_LOGI(TAG, "Registering StackChan MCP tools...");
+
+        // Set head angles (yaw, pitch in degrees)
+        // SCS0009: 1 step = 0.3125 degrees, so 1 degree = 3.2 steps (= 16/5)
+        // yaw: -90..90 degrees, pitch: -30..30 degrees
+        mcp_server.AddTool(
+            "self.robot.set_head_angles",
+            "Set the head angles of the robot. yaw: horizontal (-90 to 90), pitch: vertical (-30 to 30).",
+            PropertyList({Property("yaw", kPropertyTypeInteger, 0, -90, 90),
+                          Property("pitch", kPropertyTypeInteger, 0, -30, 30)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int yaw = properties["yaw"].value<int>();
+                int pitch = properties["pitch"].value<int>();
+                int yaw_pos = 460 + yaw * 16 / 5;
+                int pitch_pos = 620 + pitch * 16 / 5;
+                if (yaw_pos < 0) yaw_pos = 0;
+                if (yaw_pos > 1000) yaw_pos = 1000;
+                if (pitch_pos < 0) pitch_pos = 0;
+                if (pitch_pos > 1000) pitch_pos = 1000;
+                int r1 = scs_bus_.WritePos(SERVO_YAW_ID, yaw_pos, 100, 0);
+                int r2 = scs_bus_.WritePos(SERVO_PITCH_ID, pitch_pos, 100, 0);
+                ESP_LOGI(TAG, "set_head_angles: yaw=%d (pos=%d) r=%d, pitch=%d (pos=%d) r=%d, uart=%d, servo_ok=%d",
+                         yaw, yaw_pos, r1, pitch, pitch_pos, r2, (int)scs_bus_.uart_num, servo_ok_);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "servo_init_ok", servo_ok_);
+                cJSON_AddNumberToObject(root, "uart_num", (int)scs_bus_.uart_num);
+                cJSON_AddNumberToObject(root, "yaw_pos", yaw_pos);
+                cJSON_AddNumberToObject(root, "pitch_pos", pitch_pos);
+                cJSON_AddNumberToObject(root, "write_yaw", r1);
+                cJSON_AddNumberToObject(root, "write_pitch", r2);
+                return root;
+            });
+
+        // Get current head angles
+        mcp_server.AddTool(
+            "self.robot.get_head_angles",
+            "Get the current head angles (yaw, pitch) of the robot in degrees.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int yaw_pos = scs_bus_.ReadPos(SERVO_YAW_ID);
+                int pitch_pos = scs_bus_.ReadPos(SERVO_PITCH_ID);
+                int yaw = (yaw_pos - 460) * 5 / 16;
+                int pitch = (pitch_pos - 620) * 5 / 16;
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddNumberToObject(root, "yaw", yaw);
+                cJSON_AddNumberToObject(root, "pitch", pitch);
+                char* str = cJSON_PrintUnformatted(root);
+                std::string result(str);
+                cJSON_free(str);
+                cJSON_Delete(root);
+                ESP_LOGI(TAG, "get_head_angles: %s", result.c_str());
+                return result;
+            });
+
+        // Diagnostic: toggle GPIO6 (servo TX) HIGH/LOW to verify physical signal
+        mcp_server.AddTool(
+            "self.robot.gpio_test",
+            "Diagnostic: toggle GPIO6 (servo TX pin) HIGH/LOW 5 times at 100ms intervals to verify physical signal output. Restores UART pins after.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+
+                gpio_num_t pin = static_cast<gpio_num_t>(SERVO_TX_PIN);
+
+                esp_err_t err_dir = gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+                cJSON_AddStringToObject(root, "set_direction", esp_err_to_name(err_dir));
+                cJSON_AddNumberToObject(root, "pin", SERVO_TX_PIN);
+
+                cJSON* toggles = cJSON_CreateArray();
+                for (int i = 0; i < 5; i++) {
+                    esp_err_t err_h = gpio_set_level(pin, 1);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    esp_err_t err_l = gpio_set_level(pin, 0);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    cJSON* item = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(item, "iter", i);
+                    cJSON_AddStringToObject(item, "high", esp_err_to_name(err_h));
+                    cJSON_AddStringToObject(item, "low", esp_err_to_name(err_l));
+                    cJSON_AddItemToArray(toggles, item);
+                }
+                cJSON_AddItemToObject(root, "toggles", toggles);
+
+                // Restore UART pin assignment after raw GPIO toggling
+                esp_err_t err_restore = uart_set_pin(SERVO_UART_NUM, SERVO_TX_PIN, SERVO_RX_PIN,
+                                                    UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+                cJSON_AddStringToObject(root, "uart_pin_restore", esp_err_to_name(err_restore));
+
+                char* str = cJSON_PrintUnformatted(root);
+                std::string result(str);
+                cJSON_free(str);
+                cJSON_Delete(root);
+                ESP_LOGI(TAG, "gpio_test: %s", result.c_str());
+                return result;
+            });
+
+        // Diagnostic: send raw bytes via uart_write_bytes, equivalent to WritePos(1, 1000, 0, 0)
+        mcp_server.AddTool(
+            "self.robot.uart_diag",
+            "Diagnostic: send raw 8 bytes (FF FF 01 04 03 E8 00 00) directly via uart_write_bytes. Returns sent byte count and rx buffer length before/after.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+
+                size_t buf_before = 0;
+                esp_err_t err_b = uart_get_buffered_data_len(SERVO_UART_NUM, &buf_before);
+                cJSON_AddStringToObject(root, "buf_before_status", esp_err_to_name(err_b));
+                cJSON_AddNumberToObject(root, "buf_before", buf_before);
+
+                const uint8_t bytes[] = {0xFF, 0xFF, 0x01, 0x04, 0x03, 0xE8, 0x00, 0x00};
+                int written = uart_write_bytes(SERVO_UART_NUM, (const char*)bytes, sizeof(bytes));
+                cJSON_AddNumberToObject(root, "written", written);
+                cJSON_AddNumberToObject(root, "expected", (int)sizeof(bytes));
+
+                // Wait for TX FIFO drain
+                esp_err_t err_wait = uart_wait_tx_done(SERVO_UART_NUM, pdMS_TO_TICKS(100));
+                cJSON_AddStringToObject(root, "tx_done_status", esp_err_to_name(err_wait));
+
+                vTaskDelay(pdMS_TO_TICKS(20));
+
+                size_t buf_after = 0;
+                esp_err_t err_a = uart_get_buffered_data_len(SERVO_UART_NUM, &buf_after);
+                cJSON_AddStringToObject(root, "buf_after_status", esp_err_to_name(err_a));
+                cJSON_AddNumberToObject(root, "buf_after", buf_after);
+
+                char* str = cJSON_PrintUnformatted(root);
+                std::string result(str);
+                cJSON_free(str);
+                cJSON_Delete(root);
+                ESP_LOGI(TAG, "uart_diag: %s", result.c_str());
+                return result;
+            });
+
+        // Set the avatar face (one of: idle, happy, thinking, sad, surprised, embarrassed).
+        // The image is rendered as a 320x240 overlay on top of the chat UI's
+        // emoji_label_ / emoji_image_; LVGL theme/Application emotion updates
+        // will keep happening underneath but are visually masked.
+        mcp_server.AddTool(
+            "self.display.set_avatar",
+            "Set the avatar face displayed on the LCD. face must be one of: "
+            "idle, happy, thinking, sad, surprised, embarrassed.",
+            PropertyList({Property("face", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string face = properties["face"].value<std::string>();
+                bool valid = (AvatarImageFor(face.c_str()) != nullptr);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "face", face.c_str());
+                if (!valid) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error",
+                        "Unknown face. Allowed: idle, happy, thinking, sad, surprised, embarrassed.");
+                    ESP_LOGW(TAG, "set_avatar rejected: unknown face '%s'", face.c_str());
+                    return root;
+                }
+                bool applied = SetAvatarExpression(face.c_str());
+                cJSON_AddBoolToObject(root, "ok", applied);
+                if (!applied) {
+                    cJSON_AddStringToObject(root, "error",
+                        "Display not ready yet; retry after a moment.");
+                }
+                ESP_LOGI(TAG, "set_avatar: face=%s applied=%d", face.c_str(), applied);
+                return root;
+            });
+
+        // Phase 2: lip-sync. Swap the avatar to one of the mouth-only frames.
+        // The shape is held until the next set_avatar / set_mouth / blink, so
+        // callers should drive it from their TTS / audio level loop.
+        mcp_server.AddTool(
+            "self.display.set_mouth",
+            "Set the avatar mouth shape. mouth must be one of: "
+            "closed, half, open, e, u. Held until the next set_avatar/set_mouth, "
+            "or until a blink restores the resting face.",
+            PropertyList({Property("mouth", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string mouth = properties["mouth"].value<std::string>();
+                bool valid = (MouthImageFor(mouth.c_str()) != nullptr);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "mouth", mouth.c_str());
+                if (!valid) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error",
+                        "Unknown mouth. Allowed: closed, half, open, e, u.");
+                    ESP_LOGW(TAG, "set_mouth rejected: unknown shape '%s'", mouth.c_str());
+                    return root;
+                }
+                bool applied = SetMouthShape(mouth.c_str());
+                cJSON_AddBoolToObject(root, "ok", applied);
+                if (!applied) {
+                    cJSON_AddStringToObject(root, "error",
+                        "Display not ready yet; retry after a moment.");
+                }
+                ESP_LOGI(TAG, "set_mouth: mouth=%s applied=%d", mouth.c_str(), applied);
+                return root;
+            });
+
+        // Phase 2: enable/disable autonomous blinking. When enabled, a
+        // background timer fires every 3-6 s (random) and runs the four-step
+        // blink sequence (half -> closed -> half -> face).
+        mcp_server.AddTool(
+            "self.display.set_blink",
+            "Enable or disable autonomous eye blinking on the avatar. "
+            "When enabled, a brief blink animation runs every 3-6 seconds.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                if (enabled) {
+                    StartBlinkTimer();
+                } else {
+                    StopBlinkTimer();
+                }
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "enabled", enabled);
+                cJSON_AddBoolToObject(root, "ok", true);
+                ESP_LOGI(TAG, "set_blink: enabled=%d", (int)enabled);
+                return root;
+            });
+
+        // Phase 7: head-touch (Si12T). Returns the latest debounced zone
+        // states plus the most recent gesture event. Polled by CC-nagi to
+        // notice TAP/STROKE on the head without holding open a stream.
+        mcp_server.AddTool(
+            "self.touch.get_touch_state",
+            "Get the current head-touch sensor state and last gesture event "
+            "(tap/stroke/idle) with its age in milliseconds.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "available", si12t_ok_);
+                cJSON_AddBoolToObject(root, "zone0", last_zone_snapshot_[0]);
+                cJSON_AddBoolToObject(root, "zone1", last_zone_snapshot_[1]);
+                cJSON_AddBoolToObject(root, "zone2", last_zone_snapshot_[2]);
+                cJSON_AddNumberToObject(root, "raw", last_output1_raw_);
+                const char* ev = "idle";
+                switch (last_event_) {
+                    case TouchEvent::TAP:    ev = "tap";    break;
+                    case TouchEvent::STROKE: ev = "stroke"; break;
+                    case TouchEvent::IDLE:
+                    default:                 ev = "idle";   break;
+                }
+                cJSON_AddStringToObject(root, "last_event", ev);
+                int64_t age_ms = -1;
+                if (last_event_us_ != 0) {
+                    int64_t now_us = (int64_t)esp_timer_get_time();
+                    age_ms = (now_us - (int64_t)last_event_us_) / 1000;
+                    if (age_ms < 0) age_ms = 0;
+                }
+                cJSON_AddNumberToObject(root, "last_event_age_ms", (double)age_ms);
+                return root;
+            });
+
+        ESP_LOGI(TAG, "StackChan MCP tools registered");
+    }
+
+public:
+    StackChanBoard() {
+        InitializePowerSaveTimer();
+        InitializeI2c();
+        InitializeAxp2101();
+        InitializeAw9523();
+        // I2cDetect() moved AFTER all I2C device initializations.
+        // The 128-address probe (i2c_master_probe over the whole bus) was
+        // leaving PY32 (0x6F) in a half-finished slave state, so the
+        // following transmit_receive (REG_VERSION via Repeated Start)
+        // timed out (0x103). Doing the scan after IOExpander/Si12T init
+        // preserves the boot-log debug info without poisoning subsequent
+        // register reads. Si12T (0x68) is unaffected on the same bus,
+        // but moving the scan is safer for any future I2C peripheral too.
+        InitializeSpi();
+        InitializeIli9342Display();
+        InitializeCamera();
+        InitializeFt6336TouchPad();
+        GetBacklight()->RestoreBrightness();
+        InitializeIOExpander();
+        InitializeServo();
+        InitializeSi12tTouch();
+        I2cDetect();
+        // Avatar auto-display disabled: WiFi config UI needs to be visible.
+        // Avatar is shown on-demand via MCP set_avatar command.
+        // InitializeAvatar();
+        RegisterMcpTools();
+    }
+
+    virtual AudioCodec* GetAudioCodec() override {
+        static CoreS3AudioCodec audio_codec(i2c_bus_,
+            AUDIO_INPUT_SAMPLE_RATE,
+            AUDIO_OUTPUT_SAMPLE_RATE,
+            AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK,
+            AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DOUT,
+            AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_AW88298_ADDR,
+            AUDIO_CODEC_ES7210_ADDR,
+            AUDIO_INPUT_REFERENCE);
+        return &audio_codec;
+    }
+
+    virtual Display* GetDisplay() override {
+        return display_;
+    }
+
+    virtual Camera* GetCamera() override {
+        return camera_;
+    }
+
+    virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {
+        static bool last_discharging = false;
+        charging = pmic_->IsCharging();
+        discharging = pmic_->IsDischarging();
+        if (discharging != last_discharging) {
+            power_save_timer_->SetEnabled(discharging);
+            last_discharging = discharging;
+        }
+
+        level = pmic_->GetBatteryLevel();
+        return true;
+    }
+
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER) {
+            power_save_timer_->WakeUp();
+        }
+        WifiBoard::SetPowerSaveLevel(level);
+    }
+
+    virtual Backlight *GetBacklight() override {
+        static CustomBacklight backlight(pmic_);
+        return &backlight;
+    }
+};
+
+DECLARE_BOARD(StackChanBoard);
