@@ -756,8 +756,15 @@ private:
         ESP_LOGI(TAG, "Init SCS0009 servo bus (UART%d, baud=%d, tx=%d, rx=%d)",
                  SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
         servo_ok_ = scs_bus_.begin(SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
-        scs_bus_.Level = 0;  // Skip ACK wait — half-duplex TX-only mode
-        ESP_LOGI(TAG, "Servo bus init: %s (Level=0, no ACK)", servo_ok_ ? "OK" : "FAILED");
+        // ACK reading is enabled (SCS::Level defaults to 1). genWrite() will
+        // wait for the SCS0009's 6-byte ACK packet before returning, which
+        // implicitly enforces an inter-frame gap and prevents a follow-up
+        // WritePos from colliding with a still-processing servo. This aligns
+        // with the M5 StackChan official BSP behaviour (which never touches
+        // Level). Was: scs_bus_.Level = 0 — turned out to silently drop
+        // every WritePos after the first one ("starts moving once, then
+        // never again" symptom).
+        ESP_LOGI(TAG, "Servo bus init: %s (Level=1, ACK enabled)", servo_ok_ ? "OK" : "FAILED");
     }
 
     // ---- Phase 7: head-touch (Si12T) sensing + reaction ----------------
@@ -1378,6 +1385,32 @@ private:
                 cJSON_Delete(root);
                 ESP_LOGI(TAG, "uart_diag: %s", result.c_str());
                 return result;
+            });
+
+        // Diagnostic: read PY32 REG_GPIO_O_L (output low byte) and report
+        // whether VM EN (pin 0) is HIGH. Used to investigate "servo stops
+        // moving after the first move_head" — if VM EN drops to LOW under
+        // load, the servo loses power even though the I2C write succeeds.
+        mcp_server.AddTool(
+            "self.robot.check_vm_en",
+            "Diagnostic: read PY32 REG_GPIO_O_L and report whether VM EN (pin 0 = servo power) is currently HIGH. "
+            "Returns {io_expander_present, i2c_read_ok, raw, vm_en_high}.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                bool present = (io_expander_ != nullptr);
+                cJSON_AddBoolToObject(root, "io_expander_present", present);
+                if (present) {
+                    uint8_t out_low = 0;
+                    bool ok = io_expander_->ReadOutputLow(&out_low);
+                    cJSON_AddBoolToObject(root, "i2c_read_ok", ok);
+                    if (ok) {
+                        cJSON_AddNumberToObject(root, "raw", out_low);
+                        cJSON_AddBoolToObject(root, "vm_en_high", (out_low & 0x01) != 0);
+                    }
+                }
+                ESP_LOGI(TAG, "check_vm_en queried");
+                return root;
             });
 
         // Set the avatar face (one of: idle, happy, thinking, sad, surprised, embarrassed).
