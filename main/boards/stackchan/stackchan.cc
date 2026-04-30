@@ -447,7 +447,12 @@ private:
     // to catch a quick "pon" (~200 ms press) while still rejecting single-
     // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
     // dropped most short taps.
-    static constexpr int SERVO_WOBBLE_STEP_MS = 200;
+    static constexpr int SERVO_WOBBLE_STEP_MS = 350;  // was 200; SCS0009 needs
+                                                       // ~125 ms to physically
+                                                       // travel ±20°, plus the
+                                                       // ACK round-trip + IFG.
+                                                       // Tighter steps caused
+                                                       // bus hangs.
     static constexpr int SERVO_WOBBLE_AMPLITUDE_DEG = 20;
 
     std::unique_ptr<Si12T> si12t_;
@@ -780,6 +785,11 @@ private:
         if (pitch_pos < 0) pitch_pos = 0;
         if (pitch_pos > 1000) pitch_pos = 1000;
         scs_bus_.WritePos(SERVO_YAW_ID, yaw_pos, 100, 0);
+        // Inter-frame gap: SCS0009 needs a few ms between half-duplex frames
+        // even with Level=1 ACK wait. Empirically without this delay, the
+        // pitch WritePos can collide with the yaw servo's still-in-progress
+        // motion and time out, hanging the bus until power cycle.
+        vTaskDelay(pdMS_TO_TICKS(10));
         scs_bus_.WritePos(SERVO_PITCH_ID, pitch_pos, 100, 0);
     }
 
@@ -1275,6 +1285,7 @@ private:
                 if (pitch_pos < 0) pitch_pos = 0;
                 if (pitch_pos > 1000) pitch_pos = 1000;
                 int r1 = scs_bus_.WritePos(SERVO_YAW_ID, yaw_pos, 100, 0);
+                vTaskDelay(pdMS_TO_TICKS(10));  // SCS0009 inter-frame gap
                 int r2 = scs_bus_.WritePos(SERVO_PITCH_ID, pitch_pos, 100, 0);
                 ESP_LOGI(TAG, "set_head_angles: yaw=%d (pos=%d) r=%d, pitch=%d (pos=%d) r=%d, uart=%d, servo_ok=%d",
                          yaw, yaw_pos, r1, pitch, pitch_pos, r2, (int)scs_bus_.uart_num, servo_ok_);
